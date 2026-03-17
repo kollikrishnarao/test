@@ -4,10 +4,10 @@ Monitors all Polymarket markets in real-time via WebSocket
 Identifies arbitrage and trading opportunities
 """
 import asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timedelta
 from loguru import logger
 
 from .config import config
@@ -34,6 +34,12 @@ class MarketData:
     yes_volume: float
     no_volume: float
     timestamp: datetime
+    resolution_time: Optional[datetime] = None  # When market closes
+    price_history: List[float] = None  # Recent price movements for momentum
+
+    def __post_init__(self):
+        if self.price_history is None:
+            self.price_history = []
 
 
 @dataclass
@@ -49,6 +55,9 @@ class Opportunity:
     expected_value: float
     confidence: float
     timestamp: datetime
+    time_to_resolution: Optional[float] = None  # Seconds until market closes
+    predicted_side: Optional[str] = None  # "YES" or "NO" for directional trades
+    signal_strength: Optional[float] = None  # 0.0-1.0 signal quality
 
 
 class MarketScanner:
@@ -112,6 +121,8 @@ class MarketScanner:
             yes_volume=1000.0,
             no_volume=900.0,
             timestamp=datetime.now(),
+            resolution_time=self._calculate_resolution_time(timeframe),
+            price_history=[0.49, 0.50, 0.51, 0.52],  # Simulated price movement
         )
 
         self.markets[market_id] = market_data
@@ -169,6 +180,152 @@ class MarketScanner:
                 timestamp=datetime.now(),
             )
             self.opportunities.append(opportunity)
+
+        # Check for LATE_CERTAINTY opportunity (directional trading at extremes)
+        if config.enable_late_certainty:
+            late_cert_opp = self._detect_late_certainty(market_data, yes_price, no_price)
+            if late_cert_opp:
+                self.opportunities.append(late_cert_opp)
+
+    def _calculate_resolution_time(self, timeframe: str) -> datetime:
+        """Calculate when a market will resolve based on timeframe"""
+        now = datetime.now()
+
+        if timeframe == "5M":
+            # Next 5-minute mark
+            minutes = (now.minute // 5 + 1) * 5
+            if minutes >= 60:
+                return now.replace(hour=now.hour + 1, minute=0, second=0, microsecond=0)
+            return now.replace(minute=minutes, second=0, microsecond=0)
+        elif timeframe == "15M":
+            # Next 15-minute mark
+            minutes = (now.minute // 15 + 1) * 15
+            if minutes >= 60:
+                return now.replace(hour=now.hour + 1, minute=0, second=0, microsecond=0)
+            return now.replace(minute=minutes, second=0, microsecond=0)
+        elif timeframe == "1H":
+            # Next hour
+            return now.replace(hour=now.hour + 1, minute=0, second=0, microsecond=0)
+        else:
+            # Default to 5 minutes from now
+            return now + timedelta(minutes=5)
+
+    def _detect_late_certainty(
+        self, market_data: MarketData, yes_price: float, no_price: float
+    ) -> Optional[Opportunity]:
+        """
+        Detect late certainty opportunities - high confidence trades at extreme prices
+
+        Strategy: Trade when price is at extremes (0.97-0.99) near market close
+        - Taker fees are negligible at these prices
+        - High confidence due to strong directional move
+        - Only need 1-3 cents profit per trade
+        """
+        if not market_data.resolution_time:
+            return None
+
+        # Calculate time to resolution
+        time_to_resolution = (market_data.resolution_time - datetime.now()).total_seconds()
+
+        # Only trade in the last 60-90 seconds (configurable window)
+        if time_to_resolution > config.late_certainty_window_seconds:
+            return None
+
+        # Check if YES price is at extreme (0.97-0.99)
+        if yes_price >= 0.97 and yes_price <= 0.99:
+            # Strong YES signal - price moved to extreme
+            confidence, signal_strength = self._calculate_signal_strength(
+                market_data.price_history, "YES", yes_price
+            )
+
+            if confidence >= config.min_win_probability:
+                # Calculate expected profit: (1.00 - 0.97) = 0.03 = 3 cents per dollar
+                profit_per_dollar = 1.0 - yes_price
+                expected_value = profit_per_dollar * 100  # As percentage
+
+                return Opportunity(
+                    opp_type=OpportunityType.LATE_CERTAINTY,
+                    market_id=market_data.market_id,
+                    asset=market_data.asset,
+                    timeframe=market_data.timeframe,
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    spread=profit_per_dollar,
+                    expected_value=expected_value,
+                    confidence=confidence,
+                    timestamp=datetime.now(),
+                    time_to_resolution=time_to_resolution,
+                    predicted_side="YES",
+                    signal_strength=signal_strength,
+                )
+
+        # Check if NO price is at extreme (0.97-0.99)
+        elif no_price >= 0.97 and no_price <= 0.99:
+            # Strong NO signal - price moved to extreme
+            confidence, signal_strength = self._calculate_signal_strength(
+                market_data.price_history, "NO", no_price
+            )
+
+            if confidence >= config.min_win_probability:
+                profit_per_dollar = 1.0 - no_price
+                expected_value = profit_per_dollar * 100
+
+                return Opportunity(
+                    opp_type=OpportunityType.LATE_CERTAINTY,
+                    market_id=market_data.market_id,
+                    asset=market_data.asset,
+                    timeframe=market_data.timeframe,
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    spread=profit_per_dollar,
+                    expected_value=expected_value,
+                    confidence=confidence,
+                    timestamp=datetime.now(),
+                    time_to_resolution=time_to_resolution,
+                    predicted_side="NO",
+                    signal_strength=signal_strength,
+                )
+
+        return None
+
+    def _calculate_signal_strength(
+        self, price_history: List[float], side: str, current_price: float
+    ) -> Tuple[float, float]:
+        """
+        Calculate confidence and signal strength based on price momentum
+
+        Returns:
+            Tuple of (confidence, signal_strength)
+        """
+        if not price_history or len(price_history) < 2:
+            return 0.90, 0.5  # Default moderate confidence
+
+        # Calculate price momentum (trend strength)
+        price_changes = [price_history[i] - price_history[i-1]
+                        for i in range(1, len(price_history))]
+
+        if not price_changes:
+            return 0.90, 0.5
+
+        # Consistent upward trend for YES
+        if side == "YES":
+            positive_changes = sum(1 for change in price_changes if change > 0)
+            momentum_score = positive_changes / len(price_changes)
+        else:  # NO
+            # For NO, we're looking at YES price declining (or NO price rising)
+            negative_changes = sum(1 for change in price_changes if change < 0)
+            momentum_score = negative_changes / len(price_changes)
+
+        # Higher momentum = higher confidence
+        # At extreme prices (0.97-0.99), even moderate momentum gives high confidence
+        base_confidence = 0.88  # Base confidence for extreme prices
+        momentum_boost = momentum_score * 0.10  # Up to 10% boost from momentum
+        confidence = min(0.99, base_confidence + momentum_boost)
+
+        # Signal strength is separate from confidence
+        signal_strength = momentum_score
+
+        return confidence, signal_strength
 
     def get_ranked_opportunities(self) -> List[Opportunity]:
         """Get opportunities ranked by expected value"""

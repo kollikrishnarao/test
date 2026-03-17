@@ -6,6 +6,7 @@ Main decision-making component of the bot
 import asyncio
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
+from datetime import datetime
 from loguru import logger
 
 from .config import config, calculate_fee_at_price
@@ -125,6 +126,11 @@ class StrategyEngine:
                 size = await self._calculate_maker_size(opportunity, capital)
                 execute = size > 0
 
+            elif opportunity.opp_type == OpportunityType.LATE_CERTAINTY:
+                # Late certainty: high confidence directional trade at extremes
+                size = await self._calculate_late_certainty_size(opportunity, capital)
+                execute = size > 0
+
             else:
                 size = 0
                 execute = False
@@ -188,6 +194,33 @@ class StrategyEngine:
         # Market making: small, frequent trades
         return capital * 0.03  # 3% per trade
 
+    async def _calculate_late_certainty_size(
+        self, opportunity: Opportunity, capital: float
+    ) -> float:
+        """
+        Calculate position size for late certainty trades
+
+        These are high-confidence directional trades at extreme prices
+        Use larger size due to high win probability and low risk
+        """
+        # Base size on confidence and signal strength
+        confidence = opportunity.confidence
+        signal_strength = opportunity.signal_strength or 0.5
+
+        # Higher confidence = larger position
+        # At 0.88 confidence: ~15% of capital
+        # At 0.95 confidence: ~25% of capital
+        confidence_multiplier = (confidence - 0.85) / 0.15  # Scale 0.85-1.0 to 0-1
+        confidence_multiplier = max(0, min(1, confidence_multiplier))
+
+        base_size = capital * 0.15  # Base 15% per trade
+        confidence_boost = capital * 0.10 * confidence_multiplier  # Up to +10%
+        size = base_size + confidence_boost
+
+        # Cap at 25% of capital per trade
+        max_size = capital * 0.25
+        return min(size, max_size)
+
     async def execute_strategy(self, decision: Decision):
         """
         Execute a trading strategy
@@ -224,6 +257,9 @@ class StrategyEngine:
 
             elif opportunity.opp_type == OpportunityType.MAKER_OPP:
                 await self._execute_maker(opportunity, size, position_id)
+
+            elif opportunity.opp_type == OpportunityType.LATE_CERTAINTY:
+                await self._execute_late_certainty(opportunity, size, position_id)
 
         except Exception as e:
             logger.error(f"Strategy execution failed: {e}")
@@ -294,6 +330,67 @@ class StrategyEngine:
         risk_manager.release_capital(position_id, expected_profit)
 
         logger.success(f"Maker strategy executed: Expected profit ${expected_profit:.2f}")
+
+    async def _execute_late_certainty(
+        self, opportunity: Opportunity, size: float, position_id: str
+    ):
+        """
+        Execute late certainty directional trade
+
+        Strategy: Buy the predicted winning side at extreme price (0.97-0.99)
+        - Use taker order (market order) since we're at extremes where fees are low
+        - Expected profit: 1-3 cents per dollar
+        - High confidence (>88%) ensures high win rate
+        """
+        predicted_side = opportunity.predicted_side
+        target_price = opportunity.yes_price if predicted_side == "YES" else opportunity.no_price
+
+        logger.info(
+            f"Late certainty trade: {predicted_side} @ ${target_price:.3f}, "
+            f"Confidence: {opportunity.confidence:.1%}, "
+            f"Time to resolution: {opportunity.time_to_resolution:.0f}s"
+        )
+
+        # Calculate fee at this extreme price (should be negligible)
+        fee_percent = calculate_fee_at_price(target_price)
+        fee_amount = fee_percent * size
+
+        # Place taker order (market order) to buy the winning side
+        order_side = OrderSide.BUY
+        await self.order_engine.place_taker_order(
+            opportunity.market_id,
+            order_side,
+            size / target_price  # Convert dollar amount to shares
+        )
+
+        # Calculate expected profit
+        # If we buy at 0.97, we get $1.00 at resolution = $0.03 profit per dollar
+        profit_per_dollar = 1.0 - target_price
+        gross_profit = profit_per_dollar * size
+        net_profit = gross_profit - fee_amount
+
+        # Log the trade
+        trading_logger.log_trade({
+            "market_id": opportunity.market_id,
+            "market_name": f"{opportunity.asset}_{opportunity.timeframe}",
+            "strategy_type": "LATE_CERTAINTY",
+            "side": predicted_side,
+            "price": target_price,
+            "size": size / target_price,
+            "fee_paid": fee_amount,
+            "rebate_earned": 0,
+            "net_pnl": net_profit,
+            "route_used": "TAKER_EXTREME",
+            "order_id": position_id,
+        })
+
+        # Release capital (simulated completion at resolution)
+        risk_manager.release_capital(position_id, net_profit)
+
+        logger.success(
+            f"Late certainty executed: {predicted_side} @ ${target_price:.3f} | "
+            f"Expected profit: ${net_profit:.2f} (fee: ${fee_amount:.4f})"
+        )
 
     async def start_strategy(self):
         """Start the strategy engine task"""
